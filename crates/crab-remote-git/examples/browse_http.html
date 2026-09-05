@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Crab · Remote Git inspector</title>
+<style>
+:root{font:15px/1.5 system-ui,sans-serif;color:#202a37;background:#f3f5f7}*{box-sizing:border-box}body{margin:0}header{background:#15283b;color:white;padding:25px max(24px,calc((100vw - 1180px)/2))}h1{font-size:25px;margin:0}header p{color:#bdcfdf;margin:5px 0 0}main{max-width:1228px;margin:auto;padding:24px}.panel{background:white;border:1px solid #dce2e8;border-radius:10px;padding:20px;margin-bottom:20px}.controls{display:flex;gap:10px;flex-wrap:wrap;align-items:end}label{font-size:12px;color:#526477;display:grid;gap:5px}input,select,button{font:inherit;border:1px solid #bcc9d5;border-radius:5px;padding:8px 11px;background:white;color:#203950}input{min-width:290px}button{cursor:pointer}button:hover{background:#edf4fa}button:disabled{opacity:.5;cursor:wait}.primary{background:#1668a6;color:white}.primary:hover{background:#105587}.link{border:0;background:none;padding:0;color:#1267a6;text-align:left}.muted{color:#64758a;font-size:13px}.mono,pre{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.toolbar{display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin-bottom:14px}h2{font-size:17px;margin:0}table{width:100%;border-collapse:collapse;font-size:13px}td,th{padding:9px 6px;border-bottom:1px solid #edf0f3;text-align:left;vertical-align:top}th{color:#68788a;font-weight:500}td{overflow-wrap:anywhere}pre{background:#f7f9fb;padding:18px;overflow:auto;max-height:560px;font-size:12px;white-space:pre-wrap}#error{color:#a22027;white-space:pre-wrap}#location{overflow-wrap:anywhere}#benchmark{margin-top:12px}.scroll{overflow:auto;max-height:380px}.oid{font-size:12px;color:#64758a}a{color:#1267a6}.grow{flex:1}.timing{font-variant-numeric:tabular-nums;white-space:nowrap}
+</style>
+</head>
+<body>
+<header><h1>Crab / Remote Git inspector</h1><p>Browse repository data directly from object storage. No local clone.</p></header>
+<main>
+<section class="panel">
+<div class="controls">
+<label>Reference<select id="refs"><option value="">HEAD</option></select></label>
+<label class="grow">Revision · ref or full commit SHA<input id="rev" placeholder="HEAD"></label>
+<label>Cache mode<select id="mode"><option value="warm">Warm · shared runtime</option><option value="cold">Cold · fresh runtime</option></select></label>
+<button id="root" class="primary">Browse tree</button><button id="history">Commits</button><button id="commit">Commit details</button>
+</div>
+<p id="repository" class="muted">Opening repository…</p>
+<div class="controls"><label class="grow">File or directory path<input id="path" placeholder="e.g. pkg/kubelet/kubelet.go"></label><button id="directory">Open directory</button><button id="file">Read file</button></div>
+<p id="error" role="alert"></p>
+</section>
+<section class="panel">
+<div class="toolbar"><button id="up">↑ Parent</button><h2 id="location">/</h2><span class="grow"></span><button id="repeat">Repeat request</button><button id="bench">Benchmark this request</button></div>
+<p id="benchmark" class="muted">Benchmark: one cold request, one shared-runtime warm-up, then five warm samples.</p>
+<p id="detail" class="muted"></p><div id="content" class="scroll"></div><div id="pagination"></div>
+</section>
+<section class="panel">
+<h2>Request latency <span id="status" class="muted" aria-live="polite"></span></h2>
+<p class="muted">Milliseconds. Open = fresh repository handshake. Read = crate operation, JSON encoding, and locator close. Total also includes cold runtime shutdown. Round trip includes receiving the full response body.</p>
+<div class="scroll"><table><thead><tr><th>Request</th><th>Mode</th><th>Open</th><th>Read</th><th>Total</th><th>Round trip</th><th>Bytes</th><th>Status</th></tr></thead><tbody id="timings"></tbody></table></div>
+<p class="muted">Cold resets Crab runtime caches only; RustFS, OS, and transport caches may remain warm. Shared-runtime requests can still miss caches. Repository generation is pinned at startup; restart after a push. Blob responses contain Git bytes, including pointer files.</p>
+</section>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const text = (tag, value, className = '') => {const node = document.createElement(tag); node.textContent = value; node.className = className; return node;};
+const button = (label, action) => {const node = text('button', label, 'link'); node.onclick = () => run(action); return node;};
+let current = {action:'tree', args:{}}, busy = false;
+const encoder = new TextEncoder(), decoder = new TextDecoder();
+const hex = bytes => [...bytes].map(byte => byte.toString(16).padStart(2,'0')).join('');
+const unhex = value => new Uint8Array((value.match(/../g) || []).map(byte => parseInt(byte,16)));
+const revision = () => $('rev').value.trim() ? {rev:$('rev').value.trim()} : {};
+function requestUrl(target, mode) {return '/api/' + target.action + '?' + new URLSearchParams({...target.args, mode});}
+async function request(target, mode) {
+  const started = performance.now();
+  const response = await fetch(requestUrl(target, mode), {cache:'no-store'});
+  const body = new Uint8Array(await response.arrayBuffer());
+  const roundTrip = performance.now() - started;
+  const timings = Object.fromEntries([...(response.headers.get('server-timing') || '').matchAll(/(\w+);dur=([\d.]+)/g)].map(match => [match[1], Number(match[2])]));
+  const row = document.createElement('tr');
+  for (const value of [target.action,mode,...['open','read','total'].map(key => timings[key]?.toFixed(3) ?? '—'),roundTrip.toFixed(3),body.length.toLocaleString(),response.status]) row.append(text('td',value,'timing'));
+  $('timings').prepend(row);
+  while ($('timings').children.length > 30) $('timings').lastChild.remove();
+  if (!response.ok) throw new Error('HTTP ' + response.status + ': ' + decoder.decode(body));
+  return {body,response,roundTrip,total:timings.total};
+}
+async function run(action) {
+  if (busy) return;
+  busy = true; $('error').textContent = ''; $('status').textContent = ' · reading…';
+  document.querySelectorAll('button,input,select').forEach(node => node.disabled = true);
+  try {await action();} catch (error) {$('error').textContent = error.message;}
+  finally {busy = false; $('status').textContent = ''; document.querySelectorAll('button,input,select').forEach(node => node.disabled = false);}
+}
+async function show(target) {
+  current = target;
+  $('benchmark').textContent = 'Benchmark: one cold request, one shared-runtime warm-up, then five warm samples.';
+  const {body,response} = await request(target,$('mode').value);
+  $('location').textContent = target.action + ' /' + (target.args.path_hex ? decoder.decode(unhex(target.args.path_hex)) : target.args.path || '');
+  $('detail').textContent = 'Generation ' + response.headers.get('x-crab-generation') + ' · commit ' + (response.headers.get('x-crab-commit') || '—');
+  $('content').replaceChildren(); $('pagination').replaceChildren();
+  if (target.action === 'blob') {
+    $('detail').textContent += ' · blob ' + response.headers.get('x-crab-blob-oid') + ' · ' + body.length.toLocaleString() + ' bytes · ' + response.headers.get('x-crab-content-class');
+    const download = text('a','Download exact Git bytes'); download.href = requestUrl(target,$('mode').value); download.download = 'blob';
+    $('content').append(download, text('pre',body.includes(0) ? 'Binary file. Download to inspect.' : decoder.decode(body.slice(0,200000)) + (body.length > 200000 ? '\n[Preview truncated to 200 KB]' : '')));
+    return;
+  }
+  const data = JSON.parse(decoder.decode(body));
+  if (target.action === 'commit') {$('content').append(text('pre',JSON.stringify(data,null,2))); return;}
+  const table = document.createElement('table');
+  for (const item of data.items) {
+    const row = document.createElement('tr'), label = document.createElement('td');
+    if (target.action === 'tree') {
+      label.append(item.kind === 'Submodule' ? text('span', item.path + ' (submodule)') : button((item.kind === 'Tree' ? '▸ ' : '') + item.path, () => show({action:item.kind === 'Tree' ? 'tree' : 'blob',args:{...revision(),path_hex:item.path_hex}})));
+      row.append(label,text('td',item.mode,'mono'),text('td',item.oid,'mono oid'));
+    } else {
+      label.append(button(item.oid.slice(0,12), () => {$('rev').value = item.oid; return show({action:'tree',args:revision()});}));
+      row.append(label,text('td',item.message.split('\n')[0]),text('td',item.author),text('td',new Date(item.author_seconds * 1000).toISOString().slice(0,10)));
+    }
+    table.append(row);
+  }
+  $('content').append(table);
+  if (data.next) $('pagination').append(button('Next page →', () => show({...target,args:{...target.args,cursor:data.next}})));
+}
+$('root').onclick = () => run(() => show({action:'tree',args:revision()}));
+$('history').onclick = () => run(() => show({action:'commits',args:{...revision(),limit:20}}));
+$('commit').onclick = () => run(() => show({action:'commit',args:revision()}));
+$('directory').onclick = () => run(() => show({action:'tree',args:{...revision(),path:$('path').value}}));
+$('file').onclick = () => run(() => show({action:'blob',args:{...revision(),path:$('path').value}}));
+$('repeat').onclick = () => run(() => show(current));
+$('refs').onchange = () => {$('rev').value = $('refs').value; run(() => show({action:'tree',args:revision()}));};
+$('up').onclick = () => run(() => {
+  const bytes = current.args.path_hex ? unhex(current.args.path_hex) : encoder.encode(current.args.path || '');
+  const slash = bytes.lastIndexOf(47);
+  return show({action:'tree',args:{...revision(),path_hex:slash < 0 ? '' : hex(bytes.slice(0,slash))}});
+});
+$('bench').onclick = () => run(async () => {
+  $('benchmark').textContent = 'Running cold request…';
+  const cold = await request(current,'cold');
+  $('benchmark').textContent = 'Priming shared runtime…'; await request(current,'warm');
+  const warm = [];
+  for (let i=0;i<5;i++) {$('benchmark').textContent = 'Warm sample ' + (i+1) + '/5…'; warm.push(await request(current,'warm'));}
+  const median = key => warm.map(sample => sample[key]).sort((a,b) => a-b)[2].toFixed(3);
+  $('benchmark').textContent = `Cold: ${cold.total.toFixed(3)} ms server / ${cold.roundTrip.toFixed(3)} ms round trip. Warm median (5 samples): ${median('total')} ms server / ${median('roundTrip')} ms round trip.`;
+});
+run(async () => {
+  const {body} = await request({action:'refs',args:{}},'warm');
+  const data = JSON.parse(decoder.decode(body));
+  $('repository').textContent = `Pinned generation ${data.generation} · ${data.packs} pack(s) · ${data.refs.length} ref(s) · HEAD ${data.head?.oid || 'unborn'}`;
+  for (const ref of data.refs) {const option = text('option',ref.name); option.value = ref.name; $('refs').append(option);}
+  await show(current);
+});
+</script>
+</body>
+</html>

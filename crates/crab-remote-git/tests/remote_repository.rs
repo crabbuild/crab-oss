@@ -340,6 +340,17 @@ impl PackFixture {
                 (0o100644, "blob", non_utf8_blob, b"\xffx"),
             ],
         );
+        let ordered_tree = make_tree(
+            &git_dir,
+            &[
+                (0o100644, "blob", deep_blob, b"item.ext"),
+                (0o040000, "tree", nested_tree, b"item"),
+                (0o100644, "blob", deep_blob, b"item0"),
+                (0o100644, "blob", non_utf8_blob, b"\xfe.ext"),
+                (0o040000, "tree", nested_tree, b"\xfe"),
+                (0o100644, "blob", non_utf8_blob, b"\xfe0"),
+            ],
+        );
         let submodule_commit = parse_oid(&git(
             &[
                 "--git-dir",
@@ -380,6 +391,7 @@ impl PackFixture {
             (0o100644, "blob", non_utf8_blob, b"\xff.txt".to_vec()),
             (0o040000, "tree", directory_tree, b"dir".to_vec()),
             (0o040000, "tree", raw_name_tree, b"raw".to_vec()),
+            (0o040000, "tree", ordered_tree, b"ordered".to_vec()),
             (0o160000, "commit", submodule_commit, b"module".to_vec()),
         ]);
         let tree = make_tree_owned(&git_dir, &root_entries);
@@ -508,6 +520,7 @@ impl PackFixture {
                 directory_tree.to_string(),
                 submodule_tree.to_string(),
                 raw_name_tree.to_string(),
+                ordered_tree.to_string(),
                 submodule_commit.to_string(),
                 tree.to_string(),
                 semantic_type_tree.to_string(),
@@ -2337,6 +2350,69 @@ async fn browser_paths_preserve_modes_and_never_follow_links_or_gitlinks() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn directory_pages_preserve_git_order_for_shared_file_and_tree_prefixes() {
+    let fixture = publish(DeltaKind::Ref, false, RepositoryOptions::default()).await;
+    let cancellation = CancellationToken::new();
+    let operation = fixture
+        .repository
+        .operation(OperationKind::Tree, &cancellation)
+        .await
+        .expect("operation");
+    let result = async {
+        let snapshot = fixture
+            .repository
+            .snapshot(&Revision::Reference("main".to_owned()), &operation)
+            .await?;
+        let revision = format!("{}:ordered", snapshot.commit_oid());
+        let expected = git(
+            &[
+                "--git-dir",
+                path(&fixture.source_git_dir),
+                "ls-tree",
+                "--name-only",
+                "-z",
+                &revision,
+            ],
+            None,
+        )
+        .split(|byte| *byte == 0)
+        .filter(|name| !name.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect::<Vec<_>>();
+        let directory = GitPath::new(Bytes::from_static(b"ordered"))?;
+        for metadata in [DirectoryMetadata::None, DirectoryMetadata::BlobSizes] {
+            for limit in [1, 2, 3] {
+                let mut cursor = None;
+                let mut names = Vec::new();
+                for _ in 0..=expected.len() {
+                    let request = PageRequest::new(limit, cursor.take())?;
+                    let page = snapshot
+                        .list_directory_with_metadata(&directory, &request, metadata, &operation)
+                        .await?;
+                    names.extend(
+                        page.items
+                            .iter()
+                            .map(|entry| entry.path.file_name().expect("child name").to_vec()),
+                    );
+                    cursor = page.next;
+                    if cursor.is_none() {
+                        break;
+                    }
+                }
+                assert_eq!(
+                    (&names, cursor.is_none()),
+                    (&expected, true),
+                    "metadata={metadata:?}, page size={limit}"
+                );
+            }
+        }
+        Ok(())
+    }
+    .await;
+    operation.finish(result).await.expect("finish operation");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn directory_cursor_binds_raw_path_tree_commit_and_page_shape() {
     let fixture = publish(DeltaKind::Ref, false, RepositoryOptions::default()).await;
     let cancellation = CancellationToken::new();
@@ -2365,6 +2441,23 @@ async fn directory_cursor_binds_raw_path_tree_commit_and_page_shape() {
             )
             .await?;
         assert_eq!(second.items[0].path.file_name(), Some(b"\xff".as_slice()));
+
+        let mut absent_name = encoded.as_bytes().to_vec();
+        *absent_name.last_mut().expect("cursor name") = 0xfd;
+        let absent_name = PageCursor::from_bytes(Bytes::from(absent_name))?;
+        let absent_entry = snapshot
+            .list_directory(
+                &raw_path,
+                &PageRequest::new(1, Some(absent_name))?,
+                &operation,
+            )
+            .await;
+        assert!(matches!(
+            absent_entry,
+            Err(Error::InvalidCursor {
+                reason: CursorError::ContextMismatch
+            })
+        ));
 
         let wrong_shape = snapshot
             .list_directory(
@@ -4139,6 +4232,59 @@ async fn rejects_wrong_kind_and_unreachable_retained_commit() {
         })
     ));
     operation.finish(Ok(())).await.expect("finish operation");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn direct_commit_resolution_checks_both_merge_parents_before_deeper_history() {
+    for (first_parent, maximum) in [(true, 2), (false, 3)] {
+        let options = RepositoryOptions::new(
+            ObjectLimits::default(),
+            OperationLimits {
+                max_history_commits: maximum,
+                ..OperationLimits::default()
+            },
+        )
+        .expect("repository options");
+        let fixture = publish(DeltaKind::Ref, false, options).await;
+        let (mut manifest, etag) = read_manifest(&fixture.store, &fixture.layout)
+            .await
+            .expect("manifest");
+        manifest.refs.retain(|name, _| name == "refs/heads/main");
+        manifest.peeled_refs.clear();
+        manifest.seal_git_validation();
+        write_manifest_cas(&fixture.store, &fixture.layout, &manifest, &etag)
+            .await
+            .expect("publish merge as the only ref");
+        let cancellation = CancellationToken::new();
+        let repository = RemoteGitRepository::open(
+            fixture.store.clone(),
+            fixture.layout.clone(),
+            fixture.repository.identity().clone(),
+            Arc::clone(&fixture.runtime),
+            options,
+            &cancellation,
+        )
+        .await
+        .expect("reopen fixture");
+        let target = if first_parent {
+            fixture.root_commit
+        } else {
+            fixture.side_commit
+        };
+        let operation = repository
+            .operation(OperationKind::Resolve, &cancellation)
+            .await
+            .expect("operation");
+        let result = repository
+            .resolve(&Revision::Commit(target), &operation)
+            .await;
+        let resolved = operation.finish(result).await;
+        fixture.runtime.shutdown().await;
+        assert_eq!(
+            resolved.expect("nearby parent fits the budget").commit,
+            target
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

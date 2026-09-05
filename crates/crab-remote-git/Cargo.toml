@@ -34,9 +34,12 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
 crab-metadata = { workspace = true, features = ["remote-index", "storage"] }
 object_store = { workspace = true }
 proptest = "1"
+rand = "0.9"
+serde = { workspace = true }
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
 tracing-subscriber = "0.3"

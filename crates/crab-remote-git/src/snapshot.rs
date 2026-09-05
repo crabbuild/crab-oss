@@ -720,7 +720,7 @@ impl RemoteGitSnapshot {
             });
         }
         let entries = operation.read_tree(directory.oid, path).await?;
-        let after = match page.after() {
+        let mut after = match page.after() {
             Some(cursor) => {
                 let decoded = cursor.decode_directory()?;
                 let expected_limit =
@@ -757,7 +757,13 @@ impl RemoteGitSnapshot {
             if position % 256 == 0 {
                 operation.ensure_active()?;
             }
-            if after.is_some_and(|name| entry.path.file_name().is_none_or(|value| value <= name)) {
+            // The cursor pins this exact tree. Resume after its named entry:
+            // Git sorts directories with a trailing slash, so plain name
+            // comparisons can skip directories or repeat neighboring files.
+            if let Some(name) = after {
+                if entry.path.file_name() == Some(name) {
+                    after = None;
+                }
                 continue;
             }
             if items.len() == page.limit() {
@@ -765,6 +771,11 @@ impl RemoteGitSnapshot {
                 break;
             }
             items.push(entry);
+        }
+        if after.is_some() {
+            return Err(Error::InvalidCursor {
+                reason: crate::CursorError::ContextMismatch,
+            });
         }
         if metadata == DirectoryMetadata::BlobSizes {
             let positions_and_oids = items
